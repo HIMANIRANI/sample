@@ -2,6 +2,7 @@ import os
 import json
 import torch
 import pickle
+import gzip
 from tqdm import tqdm
 from langchain_community.vectorstores import FAISS
 from langchain.schema import Document
@@ -17,10 +18,39 @@ model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2', device=de
 # 3. Define paths
 company_folder = 'updated_company_data'
 save_path = 'company_vec'
-texts_cache = 'texts.pkl'
-embeddings_cache = 'embeddings.pkl'
+texts_cache = 'texts.pkl.gz'
+embeddings_cache = 'embeddings.pkl.gz'
 
-# 4. Prepare documents
+# 4. Safe pickle load and save (gzip)
+def safe_load_pickle(filename):
+    recovered = []
+    if not os.path.exists(filename):
+        return recovered
+    
+    try:
+        with gzip.open(filename, "rb") as f:
+            while True:
+                try:
+                    item = pickle.load(f)
+                    recovered.append(item)
+                except EOFError:
+                    print(f"✅ Reached end of partial pickle file: {filename}")
+                    break
+                except Exception as e:
+                    print(f"❌ Error reading {filename}: {e}")
+                    break
+    except Exception as e:
+        print(f"❌ Failed to open {filename}: {e}")
+    
+    return recovered
+
+def safe_save_pickle(obj, filename):
+    tmp_filename = filename + '.tmp'
+    with gzip.open(tmp_filename, "wb") as f:
+        pickle.dump(obj, f)
+    os.replace(tmp_filename, filename)  # Atomic replace
+
+# 5. Prepare documents
 documents = []
 indicator_requirements = {
     "SMA": 10,
@@ -77,58 +107,62 @@ for filename in os.listdir(company_folder):
 
 print(f"✅ Total documents prepared: {len(documents)}")
 
-# 5. Load existing embeddings if available
-texts = []
-embeddings = []
+# 6. Load existing embeddings if available
+texts = safe_load_pickle(texts_cache)
+embeddings = safe_load_pickle(embeddings_cache)
 
-if os.path.exists(texts_cache) and os.path.exists(embeddings_cache):
-    print("📂 Found previous cache! Resuming...")
-    with open(texts_cache, "rb") as f:
-        texts = pickle.load(f)
-    with open(embeddings_cache, "rb") as f:
-        embeddings = pickle.load(f)
+if texts and embeddings:
+    print(f"📂 Found previous cache! Resuming from document {len(texts) + 1}")
 else:
-    print("🆕 No cache found. Starting fresh...")
+    print("🆕 No previous cache found. Starting fresh...")
 
-# 6. Find where to resume
+# 7. Find where to resume
 start_index = len(texts)
-print(f"➡️ Resuming embedding from document {start_index + 1} onwards...")
 
-# 7. Embed documents in Batches
-batch_size = 32  # You can increase to 64 if GPU VRAM allows (for GTX 1650, 32 is safe)
+# 8. Embed documents in Batches
+batch_size = 32  # Still keeping small batch for GPU memory safety
+save_every = 100  # Save after every 100 embeddings
+new_embeddings_since_last_save = 0
 
 texts_to_embed = [doc.page_content for doc in documents[start_index:]]
 
 for batch_start in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding in batches"):
     batch_texts = texts_to_embed[batch_start:batch_start + batch_size]
-    
+
     try:
         batch_embeddings = model.encode(batch_texts, batch_size=batch_size, device=device, show_progress_bar=False)
 
         texts.extend(batch_texts)
         embeddings.extend(batch_embeddings)
 
-        # Save cache after every batch
-        with open(texts_cache, "wb") as f:
-            pickle.dump(texts, f)
-        with open(embeddings_cache, "wb") as f:
-            pickle.dump(embeddings, f)
+        new_embeddings_since_last_save += len(batch_texts)
 
-        print(f"💾 Saved after {len(texts)} total documents.")
-    
+        if new_embeddings_since_last_save >= save_every:
+            safe_save_pickle(texts, texts_cache)
+            safe_save_pickle(embeddings, embeddings_cache)
+            print(f"💾 Saved after {len(texts)} total documents.")
+            new_embeddings_since_last_save = 0
+
     except Exception as e:
         print(f"❌ Error in batch starting at document {batch_start+start_index+1}: {e}")
+        break
+
+# Final save if anything left
+if new_embeddings_since_last_save > 0:
+    safe_save_pickle(texts, texts_cache)
+    safe_save_pickle(embeddings, embeddings_cache)
+    print(f"💾 Final save after {len(texts)} total documents.")
 
 print("✅ All embeddings completed and cached.")
 
-# 8. Build FAISS
+# 9. Build FAISS
 print("📦 Building FAISS vectorstore...")
 company_vectorstore = FAISS.from_embeddings(
     list(zip(texts, embeddings)),
     embedding=model
 )
 
-# 9. Save FAISS index
+# 10. Save FAISS index
 if not os.path.exists(save_path):
     os.makedirs(save_path)
 
